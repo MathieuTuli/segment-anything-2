@@ -1,0 +1,905 @@
+from collections import OrderedDict
+
+from tqdm import tqdm
+
+import torch
+
+from scripts.sam2_onnx import SAM2Onnx
+from sam2.utils.misc import (
+    concat_points,
+    fill_holes_in_mask_scores,
+    load_video_frames
+)
+
+NO_OBJ_SCORE = -1024.0
+
+
+class SAM2VideoInterface:
+    def __init__(self,
+                 sam2_kwargs,
+                 fill_hole_area=0,
+                 non_overlap_masks=False,
+                 clear_non_cond_mem_around_input=False,
+                 clear_non_cond_mem_for_multi_obj=False,
+                 ):
+        self.fill_hole_area = fill_hole_area
+        self.non_overlap_masks = non_overlap_masks
+        self.clear_non_cond_mem_around_input = clear_non_cond_mem_around_input
+        self.clear_non_cond_mem_for_multi_obj = \
+            clear_non_cond_mem_for_multi_obj
+        self.state = dict()
+        self.sam2 = SAM2Onnx(**sam2_kwargs)
+        self.sam2.eval()
+
+    def init_state(self,
+                   video_path: str,
+                   offload_video_to_cpu: bool = True,
+                   offload_state_to_cpu: bool = True,
+                   async_loading_frames: bool = False,
+                   ):
+        images, video_height, video_width = load_video_frames(
+            video_path=video_path,
+            image_size=self.sam2.image_size,
+            offload_video_to_cpu=offload_video_to_cpu,
+            async_loading_frames=async_loading_frames,
+        )
+        self.state["images"] = images
+        self.state["num_frames"] = len(images)
+        self.state["offload_video_to_cpu"] = offload_video_to_cpu
+        self.state["offload_state_to_cpu"] = offload_state_to_cpu
+        self.state["video_width"] = video_width
+        self.state["video_height"] = video_height
+        # TODO change to cuda
+        self.state["device"] = torch.device("cpu")
+        if offload_state_to_cpu:
+            self.state["storage_device"] = torch.device("cpu")
+        else:
+            self.state["storage_device"] = torch.device("cuda")
+        self.state["point_inputs_per_obj"] = dict()
+        self.state["mask_inputs_per_obj"] = dict()
+        self.state["cached_features"] = {}
+        self.state["constants"] = {}
+        self.state["obj_id_to_idx"] = OrderedDict()
+        self.state["obj_idx_to_id"] = OrderedDict()
+        self.state["obj_ids"] = []
+        self.state["output_dict"] = {
+            "cond_frame_outputs": {},
+            "non_cond_frame_outputs": {},
+        }
+        self.state["output_dict_per_obj"] = {}
+        self.state["temp_output_dict_per_obj"] = {}
+        self.state["consolidated_frame_inds"] = {
+            "cond_frame_outputs": set(),
+            "non_cond_frame_outputs": set(),
+        }
+        self.state["tracking_has_started"] = False
+        self.state["frames_already_tracked"] = dict()
+        # Warm up the visual backbone and cache the image feature on frame 0
+        # self._get_image_feature(self.state, frame_idx=0, batch_size=1)
+
+    def reset_state(self):
+        """Remove all input points or mask in all frames throughout the video.
+        """
+        # Reset tracking results
+        for v in self.state["point_inputs_per_obj"].values():
+            v.clear()
+        for v in self.state["mask_inputs_per_obj"].values():
+            v.clear()
+        for v in self.state["output_dict_per_obj"].values():
+            v["cond_frame_outputs"].clear()
+            v["non_cond_frame_outputs"].clear()
+        for v in self.state["temp_output_dict_per_obj"].values():
+            v["cond_frame_outputs"].clear()
+            v["non_cond_frame_outputs"].clear()
+        self.state["output_dict"]["cond_frame_outputs"].clear()
+        self.state["output_dict"]["non_cond_frame_outputs"].clear()
+        self.state["consolidated_frame_inds"]["cond_frame_outputs"].clear()
+        self.state["consolidated_frame_inds"]["non_cond_frame_outputs"].clear()
+        self.state["tracking_has_started"] = False
+        self.state["frames_already_tracked"].clear()
+
+        # Reset state
+        self.state["obj_id_to_idx"].clear()
+        self.state["obj_idx_to_id"].clear()
+        self.state["obj_ids"].clear()
+        self.state["point_inputs_per_obj"].clear()
+        self.state["mask_inputs_per_obj"].clear()
+        self.state["output_dict_per_obj"].clear()
+        self.state["temp_output_dict_per_obj"].clear()
+
+    def _get_image_feature(self, frame_idx, batch_size):
+        """Compute the image features on a given frame."""
+        # Look up in the cache first
+        image, backbone_out = self.state["cached_features"].get(
+            frame_idx, (None, None)
+        )
+        if backbone_out is None:
+            # Cache miss -- we will run inference on a single image
+            # TODO change to cuda
+            image = self.state["images"][frame_idx].cpu(
+            ).float().unsqueeze(0)
+            backbone_out = self.sam2.forward_image(image)
+            # Cache the most recent frame's feature (for repeated interactions
+            # with a frame; we can use an LRU cache for more
+            # frames in the future).
+            self.state["cached_features"] = {
+                frame_idx: (image, backbone_out)}
+
+        # expand the features to have the same dimension as the num of objects
+        expanded_image = image.expand(batch_size, -1, -1, -1)
+        expanded_backbone_out = {
+            "backbone_fpn": backbone_out["backbone_fpn"].copy(),
+            "vision_pos_enc": backbone_out["vision_pos_enc"].copy(),
+        }
+        for i, feat in enumerate(expanded_backbone_out["backbone_fpn"]):
+            expanded_backbone_out["backbone_fpn"][i] = feat.expand(
+                batch_size, -1, -1, -1
+            )
+        for i, pos in enumerate(expanded_backbone_out["vision_pos_enc"]):
+            pos = pos.expand(batch_size, -1, -1, -1)
+            expanded_backbone_out["vision_pos_enc"][i] = pos
+
+        features = self.sam2._prepare_backbone_features(expanded_backbone_out)
+        features = (expanded_image,) + features
+        return features
+
+    def _run_single_frame_inference(
+        self,
+        output_dict,
+        frame_idx,
+        batch_size,
+        is_init_cond_frame,
+        point_inputs,
+        mask_inputs,
+        reverse,
+        run_mem_encoder,
+        prev_sam_mask_logits=None,
+    ):
+        """Run tracking on a single frame based on current inputs and previous memory."""
+        # Retrieve correct image features
+        (
+            _,
+            _,
+            current_vision_feats,
+            current_vision_pos_embeds,
+            feat_sizes,
+        ) = self._get_image_feature(frame_idx, batch_size)
+
+        # point and mask should not appear as input imultaneously on same frame
+        assert point_inputs is None or mask_inputs is None
+        current_out = self.sam2.track_step(
+            frame_idx=frame_idx,
+            is_init_cond_frame=is_init_cond_frame,
+            current_vision_feats=current_vision_feats,
+            current_vision_pos_embeds=current_vision_pos_embeds,
+            feat_sizes=feat_sizes,
+            point_inputs=point_inputs,
+            mask_inputs=mask_inputs,
+            output_dict=output_dict,
+            num_frames=self.state["num_frames"],
+            track_in_reverse=reverse,
+            run_mem_encoder=run_mem_encoder,
+            prev_sam_mask_logits=prev_sam_mask_logits,
+        )
+
+        # optionally offload the output to CPU memory to save GPU space
+        storage_device = self.state["storage_device"]
+        maskmem_features = current_out["maskmem_features"]
+        if maskmem_features is not None:
+            maskmem_features = maskmem_features.to(torch.bfloat16)
+            maskmem_features = maskmem_features.to(storage_device,
+                                                   non_blocking=True)
+        pred_masks_gpu = current_out["pred_masks"]
+        # potentially fill holes in the predicted masks
+        if self.fill_hole_area > 0:
+            pred_masks_gpu = fill_holes_in_mask_scores(
+                pred_masks_gpu, self.fill_hole_area
+            )
+        pred_masks = pred_masks_gpu.to(storage_device, non_blocking=True)
+        # "maskmem_pos_enc" is the same across frames, so we only need to store one copy of it
+        maskmem_pos_enc = self._get_maskmem_pos_enc(self.state, current_out)
+        # object pointer is a small tensor, so we always keep it on GPU memory for fast access
+        obj_ptr = current_out["obj_ptr"]
+        # make a compact version of this frame's output to reduce the state size
+        compact_current_out = {
+            "maskmem_features": maskmem_features,
+            "maskmem_pos_enc": maskmem_pos_enc,
+            "pred_masks": pred_masks,
+            "obj_ptr": obj_ptr,
+        }
+        return compact_current_out, pred_masks_gpu
+
+    def _obj_id_to_idx(self, obj_id):
+        """Map client-side object id to model-side object index."""
+        obj_idx = self.state["obj_id_to_idx"].get(obj_id, None)
+        if obj_idx is not None:
+            return obj_idx
+
+        # This is a new object id not sent to the server before. We only allow adding
+        # new objects *before* the tracking starts.
+        allow_new_object = not self.state["tracking_has_started"]
+        if allow_new_object:
+            # get the next object slot
+            obj_idx = len(self.state["obj_id_to_idx"])
+            self.state["obj_id_to_idx"][obj_id] = obj_idx
+            self.state["obj_idx_to_id"][obj_idx] = obj_id
+            self.state["obj_ids"] = list(self.state["obj_id_to_idx"])
+            # set up input and output structures for this object
+            self.state["point_inputs_per_obj"][obj_idx] = {}
+            self.state["mask_inputs_per_obj"][obj_idx] = {}
+            self.state["output_dict_per_obj"][obj_idx] = {
+                "cond_frame_outputs": {},  # dict containing {frame_idx: <out>}
+                "non_cond_frame_outputs": {},  # dict containing {frame_idx: <out>}
+            }
+            self.state["temp_output_dict_per_obj"][obj_idx] = {
+                "cond_frame_outputs": {},  # dict containing {frame_idx: <out>}
+                "non_cond_frame_outputs": {},  # dict containing {frame_idx: <out>}
+            }
+            return obj_idx
+        else:
+            raise RuntimeError(
+                f"Cannot add new object id {obj_id} after tracking starts. "
+                f"All existing object ids: {self.state['obj_ids']}. "
+                f"Please call 'reset_state' to restart from scratch."
+            )
+
+    def _obj_idx_to_id(self, obj_idx):
+        """Map model-side object index to client-side object id."""
+        return self.state["obj_idx_to_id"][obj_idx]
+
+    def _get_obj_num(self):
+        """Get the total number of unique object ids received
+        so far in this session."""
+        return len(self.state["obj_idx_to_id"])
+
+    def _add_output_per_object(
+        self, frame_idx, current_out, storage_key
+    ):
+        """
+        Split a multi-object output into per-object output slices and add them into
+        `output_dict_per_obj`. The resulting slices share the same tensor storage.
+        """
+        maskmem_features = current_out["maskmem_features"]
+        assert maskmem_features is None or isinstance(
+            maskmem_features, torch.Tensor)
+
+        maskmem_pos_enc = current_out["maskmem_pos_enc"]
+        assert maskmem_pos_enc is None or isinstance(maskmem_pos_enc, list)
+
+        output_dict_per_obj = self.state["output_dict_per_obj"]
+        for obj_idx, obj_output_dict in output_dict_per_obj.items():
+            obj_slice = slice(obj_idx, obj_idx + 1)
+            obj_out = {
+                "maskmem_features": None,
+                "maskmem_pos_enc": None,
+                "pred_masks": current_out["pred_masks"][obj_slice],
+                "obj_ptr": current_out["obj_ptr"][obj_slice],
+            }
+            if maskmem_features is not None:
+                obj_out["maskmem_features"] = maskmem_features[obj_slice]
+            if maskmem_pos_enc is not None:
+                obj_out["maskmem_pos_enc"] = [x[obj_slice]
+                                              for x in maskmem_pos_enc]
+            obj_output_dict[storage_key][frame_idx] = obj_out
+
+    def _clear_non_cond_mem_around_input(self, frame_idx):
+        """
+        Remove the non-conditioning memory around the input frame. When users provide
+        correction clicks, the surrounding frames' non-conditioning memories can still
+        contain outdated object appearance information and could confuse the model.
+
+        This method clears those non-conditioning memories surrounding the interacted
+        frame to avoid giving the model both old and new information about the object.
+        """
+        r = self.memory_temporal_stride_for_eval
+        frame_idx_begin = frame_idx - r * self.num_maskmem
+        frame_idx_end = frame_idx + r * self.num_maskmem
+        output_dict = self.state["output_dict"]
+        non_cond_frame_outputs = output_dict["non_cond_frame_outputs"]
+        for t in range(frame_idx_begin, frame_idx_end + 1):
+            non_cond_frame_outputs.pop(t, None)
+            for obj_output_dict in self.state["output_dict_per_obj"].values():
+                obj_output_dict["non_cond_frame_outputs"].pop(t, None)
+
+    def _get_empty_mask_ptr(self, frame_idx):
+        """Get a dummy object pointer based on an empty mask on the current frame."""
+        # A dummy (empty) mask with a single object
+        batch_size = 1
+        mask_inputs = torch.zeros(
+            (batch_size, 1, self.sam2.image_size, self.sam2.image_size),
+            dtype=torch.float32,
+            device=self.state["device"],
+        )
+
+        # Retrieve correct image features
+        (
+            _,
+            _,
+            current_vision_feats,
+            current_vision_pos_embeds,
+            feat_sizes,
+        ) = self._get_image_feature(frame_idx, batch_size)
+
+        # Feed the empty mask and image feature above to get a dummy object pointer
+        current_out = self.track_step(
+            frame_idx=frame_idx,
+            is_init_cond_frame=True,
+            current_vision_feats=current_vision_feats,
+            current_vision_pos_embeds=current_vision_pos_embeds,
+            feat_sizes=feat_sizes,
+            point_inputs=None,
+            mask_inputs=mask_inputs,
+            output_dict={},
+            num_frames=self.state["num_frames"],
+            track_in_reverse=False,
+            run_mem_encoder=False,
+            prev_sam_mask_logits=None,
+        )
+        return current_out["obj_ptr"]
+
+    def _get_maskmem_pos_enc(self, current_out):
+        """
+        `maskmem_pos_enc` is the same across frames and objects, so we cache it as
+        a constant in the inference session to reduce session storage size.
+        """
+        model_constants = self.state["constants"]
+        # "out_maskmem_pos_enc" should be either a list of tensors or None
+        out_maskmem_pos_enc = current_out["maskmem_pos_enc"]
+        if out_maskmem_pos_enc is not None:
+            if "maskmem_pos_enc" not in model_constants:
+                assert isinstance(out_maskmem_pos_enc, list)
+                # only take the slice for one object, since it's same across objects
+                maskmem_pos_enc = [x[0:1].clone() for x in out_maskmem_pos_enc]
+                model_constants["maskmem_pos_enc"] = maskmem_pos_enc
+            else:
+                maskmem_pos_enc = model_constants["maskmem_pos_enc"]
+            # expand the cached maskmem_pos_enc to the actual batch size
+            batch_size = out_maskmem_pos_enc[0].size(0)
+            expanded_maskmem_pos_enc = [
+                x.expand(batch_size, -1, -1, -1) for x in maskmem_pos_enc
+            ]
+        else:
+            expanded_maskmem_pos_enc = None
+        return expanded_maskmem_pos_enc
+
+    def _run_memory_encoder(
+        self, frame_idx, batch_size, high_res_masks, is_mask_from_pts
+    ):
+        """
+        Run the memory encoder on `high_res_masks`. This is usually after applying
+        non-overlapping constraints to object scores. Since their scores changed, their
+        memory also need to be computed again with the memory encoder.
+        """
+        # Retrieve correct image features
+        _, _, current_vision_feats, _, feat_sizes = self._get_image_feature(
+            frame_idx, batch_size
+        )
+        maskmem_features, maskmem_pos_enc = self._encode_new_memory(
+            current_vision_feats=current_vision_feats,
+            feat_sizes=feat_sizes,
+            pred_masks_high_res=high_res_masks,
+            is_mask_from_pts=is_mask_from_pts,
+        )
+
+        # optionally offload the output to CPU memory to save GPU space
+        storage_device = self.state["storage_device"]
+        maskmem_features = maskmem_features.to(torch.bfloat16)
+        maskmem_features = maskmem_features.to(
+            storage_device, non_blocking=True)
+        # "maskmem_pos_enc" is the same across frames, so we only need to store one copy of it
+        maskmem_pos_enc = self._get_maskmem_pos_enc(
+            {"maskmem_pos_enc": maskmem_pos_enc}
+        )
+        return maskmem_features, maskmem_pos_enc
+
+    def _consolidate_temp_output_across_obj(
+        self,
+        frame_idx,
+        is_cond,
+        run_mem_encoder,
+        consolidate_at_video_res=False,
+    ):
+        """
+        Consolidate the per-object temporary outputs in `temp_output_dict_per_obj` on
+        a frame into a single output for all objects, including
+        1) fill any missing objects either from `output_dict_per_obj` (if they exist in
+           `output_dict_per_obj` for this frame) or leave them as placeholder values
+           (if they don't exist in `output_dict_per_obj` for this frame);
+        2) if specified, rerun memory encoder after apply non-overlapping constraints
+           on the object scores.
+        """
+        batch_size = self._get_obj_num()
+        storage_key = "cond_frame_outputs" if is_cond else "non_cond_frame_outputs"
+        # Optionally, we allow consolidating the temporary outputs at the original
+        # video resolution (to provide a better editing experience for mask prompts).
+        if consolidate_at_video_res:
+            assert not run_mem_encoder, "memory encoder cannot run at video resolution"
+            consolidated_H = self.state["video_height"]
+            consolidated_W = self.state["video_width"]
+            consolidated_mask_key = "pred_masks_video_res"
+        else:
+            consolidated_H = consolidated_W = self.sam2.image_size // 4
+            consolidated_mask_key = "pred_masks"
+
+        # Initialize `consolidated_out`. Its "maskmem_features" and "maskmem_pos_enc"
+        # will be added when rerunning the memory encoder after applying non-overlapping
+        # constraints to object scores. Its "pred_masks" are prefilled with a large
+        # negative value (NO_OBJ_SCORE) to represent missing objects.
+        consolidated_out = {
+            "maskmem_features": None,
+            "maskmem_pos_enc": None,
+            consolidated_mask_key: torch.full(
+                size=(batch_size, 1, consolidated_H, consolidated_W),
+                fill_value=NO_OBJ_SCORE,
+                dtype=torch.float32,
+                device=self.state["storage_device"],
+            ),
+            "obj_ptr": torch.full(
+                size=(batch_size, self.hidden_dim),
+                fill_value=NO_OBJ_SCORE,
+                dtype=torch.float32,
+                device=self.state["device"],
+            ),
+        }
+        empty_mask_ptr = None
+        for obj_idx in range(batch_size):
+            obj_temp_output_dict = self.state["temp_output_dict_per_obj"][obj_idx]
+            obj_output_dict = self.state["output_dict_per_obj"][obj_idx]
+            out = obj_temp_output_dict[storage_key].get(frame_idx, None)
+            # If the object doesn't appear in "temp_output_dict_per_obj" on this frame,
+            # we fall back and look up its previous output in "output_dict_per_obj".
+            # We look up both "cond_frame_outputs" and "non_cond_frame_outputs" in
+            # "output_dict_per_obj" to find a previous output for this object.
+            if out is None:
+                out = obj_output_dict["cond_frame_outputs"].get(
+                    frame_idx, None)
+            if out is None:
+                out = obj_output_dict["non_cond_frame_outputs"].get(
+                    frame_idx, None)
+            # If the object doesn't appear in "output_dict_per_obj" either, we skip it
+            # and leave its mask scores to the default scores (i.e. the NO_OBJ_SCORE
+            # placeholder above) and set its object pointer to be a dummy pointer.
+            if out is None:
+                # Fill in dummy object pointers for those objects without any inputs or
+                # tracking outcomes on this frame (only do it under `run_mem_encoder=True`,
+                # i.e. when we need to build the memory for tracking).
+                if run_mem_encoder:
+                    if empty_mask_ptr is None:
+                        empty_mask_ptr = self._get_empty_mask_ptr(
+                            frame_idx
+                        )
+                    # fill object pointer with a dummy pointer (based on an empty mask)
+                    consolidated_out["obj_ptr"][obj_idx: obj_idx +
+                                                1] = empty_mask_ptr
+                continue
+            # Add the temporary object output mask to consolidated output mask
+            obj_mask = out["pred_masks"]
+            consolidated_pred_masks = consolidated_out[consolidated_mask_key]
+            if obj_mask.shape[-2:] == consolidated_pred_masks.shape[-2:]:
+                consolidated_pred_masks[obj_idx: obj_idx + 1] = obj_mask
+            else:
+                # Resize first if temporary object mask has a different resolution
+                resized_obj_mask = torch.nn.functional.interpolate(
+                    obj_mask,
+                    size=consolidated_pred_masks.shape[-2:],
+                    mode="bilinear",
+                    align_corners=False,
+                )
+                consolidated_pred_masks[obj_idx: obj_idx +
+                                        1] = resized_obj_mask
+            consolidated_out["obj_ptr"][obj_idx: obj_idx + 1] = out["obj_ptr"]
+
+        # Optionally, apply non-overlapping constraints on the consolidated scores
+        # and rerun the memory encoder
+        if run_mem_encoder:
+            device = self.state["device"]
+            high_res_masks = torch.nn.functional.interpolate(
+                consolidated_out["pred_masks"].to(device, non_blocking=True),
+                size=(self.sam2.image_size, self.sam2.image_size),
+                mode="bilinear",
+                align_corners=False,
+            )
+            if self.non_overlap_masks_for_mem_enc:
+                high_res_masks = self._apply_non_overlapping_constraints(
+                    high_res_masks)
+            maskmem_features, maskmem_pos_enc = self._run_memory_encoder(
+                frame_idx=frame_idx,
+                batch_size=batch_size,
+                high_res_masks=high_res_masks,
+                is_mask_from_pts=True,  # these frames are what the user interacted with
+            )
+            consolidated_out["maskmem_features"] = maskmem_features
+            consolidated_out["maskmem_pos_enc"] = maskmem_pos_enc
+
+        return consolidated_out
+
+    def _get_orig_video_res_output(self, any_res_masks):
+        """
+        Resize the object scores to the original video resolution (video_res_masks)
+        and apply non-overlapping constraints for final output.
+        """
+        device = self.state["device"]
+        video_H = self.state["video_height"]
+        video_W = self.state["video_width"]
+        any_res_masks = any_res_masks.to(device, non_blocking=True)
+        if any_res_masks.shape[-2:] == (video_H, video_W):
+            video_res_masks = any_res_masks
+        else:
+            video_res_masks = torch.nn.functional.interpolate(
+                any_res_masks,
+                size=(video_H, video_W),
+                mode="bilinear",
+                align_corners=False,
+            )
+        if self.non_overlap_masks:
+            video_res_masks = self._apply_non_overlapping_constraints(
+                video_res_masks)
+        return any_res_masks, video_res_masks
+
+    # MARKER @"base"
+    def _apply_non_overlapping_constraints(self, pred_masks):
+        """
+        Apply non-overlapping constraints to the object scores in pred_masks. Here we
+        keep only the highest scoring object at each spatial location in pred_masks.
+        """
+        batch_size = pred_masks.size(0)
+        if batch_size == 1:
+            return pred_masks
+
+        device = pred_masks.device
+        # "max_obj_inds": object index of the object with the highest score at each location
+        max_obj_inds = torch.argmax(pred_masks, dim=0, keepdim=True)
+        # "batch_obj_inds": object index of each object slice (along dim 0) in `pred_masks`
+        batch_obj_inds = torch.arange(batch_size, device=device)[
+            :, None, None, None]
+        keep = max_obj_inds == batch_obj_inds
+        # suppress overlapping regions' scores below -10.0 so that the foreground regions
+        # don't overlap (here sigmoid(-10.0)=4.5398e-05)
+        pred_masks = torch.where(
+            keep, pred_masks, torch.clamp(pred_masks, max=-10.0))
+        return pred_masks
+
+    @torch.inference_mode()
+    def propagate_in_video_preflight(self):
+        """ Prepare state and consolidate temporary outputs before tracking.
+        """
+        self.state["tracking_has_started"] = True
+        batch_size = self._get_obj_num()
+
+        # Consolidate per-object temporary outputs in
+        # "temp_output_dict_per_obj" and add them into "output_dict".
+        temp_output_dict_per_obj = self.state["temp_output_dict_per_obj"]
+        output_dict = self.state["output_dict"]
+        # "consolidated_frame_inds" contains indices of those frames where
+        # consolidated temporary outputs have been added (either in this call
+        # or any previous calls to `propagate_in_video_preflight`).
+        consolidated_frame_inds = self.state["consolidated_frame_inds"]
+        for is_cond in [False, True]:
+            # Separately consolidate conditioning and non-conditioning temp outptus
+            storage_key = "cond_frame_outputs" if is_cond else "non_cond_frame_outputs"
+            # Find all the frames that contain temporary outputs for any objects
+            # (these should be the frames that have just received clicks for mask inputs
+            # via `add_new_points` or `add_new_mask`)
+            temp_frame_inds = set()
+            for obj_temp_output_dict in temp_output_dict_per_obj.values():
+                temp_frame_inds.update(
+                    obj_temp_output_dict[storage_key].keys())
+            consolidated_frame_inds[storage_key].update(temp_frame_inds)
+            # consolidate the temprary output across all objects on this frame
+            for frame_idx in temp_frame_inds:
+                consolidated_out = self._consolidate_temp_output_across_obj(
+                    frame_idx, is_cond=is_cond, run_mem_encoder=True
+                )
+                # merge them into "output_dict" and also create per-object slices
+                output_dict[storage_key][frame_idx] = consolidated_out
+                self._add_output_per_object(
+                    frame_idx, consolidated_out, storage_key
+                )
+                clear_non_cond_mem = self.clear_non_cond_mem_around_input and (
+                    self.clear_non_cond_mem_for_multi_obj or batch_size <= 1
+                )
+                if clear_non_cond_mem:
+                    # clear non-conditioning memory of the surrounding frames
+                    self._clear_non_cond_mem_around_input(frame_idx)
+
+            # clear temporary outputs in `temp_output_dict_per_obj`
+            for obj_temp_output_dict in temp_output_dict_per_obj.values():
+                obj_temp_output_dict[storage_key].clear()
+
+        # edge case: if an output is added to "cond_frame_outputs", we remove any prior
+        # output on the same frame in "non_cond_frame_outputs"
+        for frame_idx in output_dict["cond_frame_outputs"]:
+            output_dict["non_cond_frame_outputs"].pop(frame_idx, None)
+        for obj_output_dict in self.state["output_dict_per_obj"].values():
+            for frame_idx in obj_output_dict["cond_frame_outputs"]:
+                obj_output_dict["non_cond_frame_outputs"].pop(frame_idx, None)
+        for frame_idx in consolidated_frame_inds["cond_frame_outputs"]:
+            assert frame_idx in output_dict["cond_frame_outputs"]
+            consolidated_frame_inds["non_cond_frame_outputs"].discard(
+                frame_idx)
+
+        # Make sure that the frame indices in "consolidated_frame_inds" are exactly those frames
+        # with either points or mask inputs (which should be true under a correct workflow).
+        all_consolidated_frame_inds = (
+            consolidated_frame_inds["cond_frame_outputs"]
+            | consolidated_frame_inds["non_cond_frame_outputs"]
+        )
+        input_frames_inds = set()
+        for point_inputs_per_frame in self.state["point_inputs_per_obj"].values():
+            input_frames_inds.update(point_inputs_per_frame.keys())
+        for mask_inputs_per_frame in self.state["mask_inputs_per_obj"].values():
+            input_frames_inds.update(mask_inputs_per_frame.keys())
+        assert all_consolidated_frame_inds == input_frames_inds
+
+    @torch.inference_mode()
+    def propagate_in_video(
+        self,
+        start_frame_idx=None,
+        max_frame_num_to_track=None,
+        reverse=False,
+    ):
+        """Propagate the input points across frames to track in the entire video."""
+        self.propagate_in_video_preflight()
+
+        output_dict = self.state["output_dict"]
+        consolidated_frame_inds = self.state["consolidated_frame_inds"]
+        obj_ids = self.state["obj_ids"]
+        num_frames = self.state["num_frames"]
+        batch_size = self._get_obj_num()
+        if len(output_dict["cond_frame_outputs"]) == 0:
+            raise RuntimeError(
+                "No points are provided; please add points first")
+        clear_non_cond_mem = self.clear_non_cond_mem_around_input and (
+            self.clear_non_cond_mem_for_multi_obj or batch_size <= 1
+        )
+
+        # set start index, end index, and processing order
+        if start_frame_idx is None:
+            # default: start from the earliest frame with input points
+            start_frame_idx = min(output_dict["cond_frame_outputs"])
+        if max_frame_num_to_track is None:
+            # default: track all the frames in the video
+            max_frame_num_to_track = num_frames
+        if reverse:
+            end_frame_idx = max(start_frame_idx - max_frame_num_to_track, 0)
+            if start_frame_idx > 0:
+                processing_order = range(
+                    start_frame_idx, end_frame_idx - 1, -1)
+            else:
+                processing_order = []  # skip reverse tracking if starting from frame 0
+        else:
+            end_frame_idx = min(
+                start_frame_idx + max_frame_num_to_track, num_frames - 1
+            )
+            processing_order = range(start_frame_idx, end_frame_idx + 1)
+
+        for frame_idx in tqdm(processing_order, desc="propagate in video"):
+            # We skip those frames already in consolidated outputs (these are frames
+            # that received input clicks or mask). Note that we cannot directly run
+            # batched forward on them via `_run_single_frame_inference` because the
+            # number of clicks on each object might be different.
+            if frame_idx in consolidated_frame_inds["cond_frame_outputs"]:
+                storage_key = "cond_frame_outputs"
+                current_out = output_dict[storage_key][frame_idx]
+                pred_masks = current_out["pred_masks"]
+                if clear_non_cond_mem:
+                    # clear non-conditioning memory of the surrounding frames
+                    self._clear_non_cond_mem_around_input(frame_idx)
+            elif frame_idx in consolidated_frame_inds["non_cond_frame_outputs"]:
+                storage_key = "non_cond_frame_outputs"
+                current_out = output_dict[storage_key][frame_idx]
+                pred_masks = current_out["pred_masks"]
+            else:
+                storage_key = "non_cond_frame_outputs"
+                current_out, pred_masks = self._run_single_frame_inference(
+                    output_dict=output_dict,
+                    frame_idx=frame_idx,
+                    batch_size=batch_size,
+                    is_init_cond_frame=False,
+                    point_inputs=None,
+                    mask_inputs=None,
+                    reverse=reverse,
+                    run_mem_encoder=True,
+                )
+                output_dict[storage_key][frame_idx] = current_out
+            # Create slices of per-object outputs for subsequent interaction with each
+            # individual object after tracking.
+            self._add_output_per_object(
+                frame_idx, current_out, storage_key
+            )
+            self.state["frames_already_tracked"][frame_idx] = {
+                "reverse": reverse}
+
+            # Resize the output mask to the original video resolution (we directly use
+            # the mask scores on GPU for output to avoid any CPU conversion in between)
+            _, video_res_masks = self._get_orig_video_res_output(pred_masks)
+            yield frame_idx, obj_ids, video_res_masks
+
+    @torch.inference_mode()
+    def add_new_points(
+        self,
+        frame_idx,
+        obj_id,
+        points,
+        labels,
+        clear_old_points=True,
+        normalize_coords=True,
+    ):
+        """Add new points to a frame."""
+        obj_idx = self._obj_id_to_idx(obj_id)
+        point_inputs_per_frame = self.state["point_inputs_per_obj"][obj_idx]
+        mask_inputs_per_frame = self.state["mask_inputs_per_obj"][obj_idx]
+
+        if not isinstance(points, torch.Tensor):
+            points = torch.tensor(points, dtype=torch.float32)
+        if not isinstance(labels, torch.Tensor):
+            labels = torch.tensor(labels, dtype=torch.int32)
+        if points.dim() == 2:
+            points = points.unsqueeze(0)  # add batch dimension
+        if labels.dim() == 1:
+            labels = labels.unsqueeze(0)  # add batch dimension
+        if normalize_coords:
+            video_H = self.state["video_height"]
+            video_W = self.state["video_width"]
+            points = points / \
+                torch.tensor([video_W, video_H]).to(points.device)
+        # scale the (normalized) coordinates by the model's internal image size
+        points = points * self.sam2.image_size
+        points = points.to(self.state["device"])
+        labels = labels.to(self.state["device"])
+
+        if not clear_old_points:
+            point_inputs = point_inputs_per_frame.get(frame_idx, None)
+        else:
+            point_inputs = None
+        point_inputs = concat_points(point_inputs, points, labels)
+
+        point_inputs_per_frame[frame_idx] = point_inputs
+        mask_inputs_per_frame.pop(frame_idx, None)
+        # If this frame hasn't been tracked before, we treat it as an initial conditioning
+        # frame, meaning that the inputs points are to generate segments on this frame without
+        # using any memory from other frames, like in SAM. Otherwise (if it has been tracked),
+        # the input points will be used to correct the already tracked masks.
+        is_init_cond_frame = frame_idx not in self.state["frames_already_tracked"]
+        # whether to track in reverse time order
+        if is_init_cond_frame:
+            reverse = False
+        else:
+            reverse = self.state["frames_already_tracked"][frame_idx]["reverse"]
+        obj_output_dict = self.state["output_dict_per_obj"][obj_idx]
+        obj_temp_output_dict = self.state["temp_output_dict_per_obj"][obj_idx]
+        # Add a frame to conditioning output if it's an initial conditioning frame or
+        # if the model sees all frames receiving clicks/mask as conditioning frames.
+        is_cond = is_init_cond_frame or self.add_all_frames_to_correct_as_cond
+        storage_key = "cond_frame_outputs" if is_cond else "non_cond_frame_outputs"
+
+        # Get any previously predicted mask logits on this object and feed it along with
+        # the new clicks into the SAM mask decoder.
+        prev_sam_mask_logits = None
+        # lookup temporary output dict first, which contains the most recent output
+        # (if not found, then lookup conditioning and non-conditioning frame output)
+        prev_out = obj_temp_output_dict[storage_key].get(frame_idx)
+        if prev_out is None:
+            prev_out = obj_output_dict["cond_frame_outputs"].get(frame_idx)
+            if prev_out is None:
+                prev_out = obj_output_dict["non_cond_frame_outputs"].get(
+                    frame_idx)
+
+        if prev_out is not None and prev_out["pred_masks"] is not None:
+            # TODO change to cuda
+            prev_sam_mask_logits = prev_out["pred_masks"].cpu(
+                non_blocking=True)
+            # Clamp the scale of prev_sam_mask_logits to avoid rare numerical issues.
+            prev_sam_mask_logits = torch.clamp(
+                prev_sam_mask_logits, -32.0, 32.0)
+        current_out, _ = self._run_single_frame_inference(
+            output_dict=obj_output_dict,  # run on the slice of a single object
+            frame_idx=frame_idx,
+            batch_size=1,  # run on the slice of a single object
+            is_init_cond_frame=is_init_cond_frame,
+            point_inputs=point_inputs,
+            mask_inputs=None,
+            reverse=reverse,
+            # Skip the memory encoder when adding clicks or mask. We execute the memory encoder
+            # at the beginning of `propagate_in_video` (after user finalize their clicks). This
+            # allows us to enforce non-overlapping constraints on all objects before encoding
+            # them into memory.
+            run_mem_encoder=False,
+            prev_sam_mask_logits=prev_sam_mask_logits,
+        )
+        # Add the output to the output dict (to be used as future memory)
+        obj_temp_output_dict[storage_key][frame_idx] = current_out
+
+        # Resize the output mask to the original video resolution
+        obj_ids = self.state["obj_ids"]
+        consolidated_out = self._consolidate_temp_output_across_obj(
+            frame_idx,
+            is_cond=is_cond,
+            run_mem_encoder=False,
+            consolidate_at_video_res=True,
+        )
+        _, video_res_masks = self._get_orig_video_res_output(
+            consolidated_out["pred_masks_video_res"]
+        )
+        return frame_idx, obj_ids, video_res_masks
+
+    @torch.inference_mode()
+    def add_new_mask(
+        self,
+        frame_idx,
+        obj_id,
+        mask,
+    ):
+        """Add new mask to a frame."""
+        obj_idx = self._obj_id_to_idx(obj_id)
+        point_inputs_per_frame = self.state["point_inputs_per_obj"][obj_idx]
+        mask_inputs_per_frame = self.state["mask_inputs_per_obj"][obj_idx]
+
+        if not isinstance(mask, torch.Tensor):
+            mask = torch.tensor(mask, dtype=torch.bool)
+        assert mask.dim() == 2
+        mask_H, mask_W = mask.shape
+        mask_inputs_orig = mask[None, None]  # add batch and channel dimension
+        mask_inputs_orig = mask_inputs_orig.float().to(self.state["device"])
+
+        # resize the mask if it doesn't match the model's image size
+        if mask_H != self.sam2.image_size or mask_W != self.sam2.image_size:
+            mask_inputs = torch.nn.functional.interpolate(
+                mask_inputs_orig,
+                size=(self.sam2.image_size, self.sam2.image_size),
+                align_corners=False,
+                mode="bilinear",
+                antialias=True,  # use antialias for downsampling
+            )
+            mask_inputs = (mask_inputs >= 0.5).float()
+        else:
+            mask_inputs = mask_inputs_orig
+
+        mask_inputs_per_frame[frame_idx] = mask_inputs
+        point_inputs_per_frame.pop(frame_idx, None)
+        # If this frame hasn't been tracked before, we treat it as an initial conditioning
+        # frame, meaning that the inputs points are to generate segments on this frame without
+        # using any memory from other frames, like in SAM. Otherwise (if it has been tracked),
+        # the input points will be used to correct the already tracked masks.
+        is_init_cond_frame = frame_idx not in self.state["frames_already_tracked"]
+        # whether to track in reverse time order
+        if is_init_cond_frame:
+            reverse = False
+        else:
+            reverse = self.state["frames_already_tracked"][frame_idx]["reverse"]
+        obj_output_dict = self.state["output_dict_per_obj"][obj_idx]
+        obj_temp_output_dict = self.state["temp_output_dict_per_obj"][obj_idx]
+        # Add a frame to conditioning output if it's an initial conditioning frame or
+        # if the model sees all frames receiving clicks/mask as conditioning frames.
+        is_cond = is_init_cond_frame or self.add_all_frames_to_correct_as_cond
+        storage_key = "cond_frame_outputs" if is_cond else "non_cond_frame_outputs"
+
+        current_out, _ = self._run_single_frame_inference(
+            output_dict=obj_output_dict,  # run on the slice of a single object
+            frame_idx=frame_idx,
+            batch_size=1,  # run on the slice of a single object
+            is_init_cond_frame=is_init_cond_frame,
+            point_inputs=None,
+            mask_inputs=mask_inputs,
+            reverse=reverse,
+            # Skip the memory encoder when adding clicks or mask. We execute the memory encoder
+            # at the beginning of `propagate_in_video` (after user finalize their clicks). This
+            # allows us to enforce non-overlapping constraints on all objects before encoding
+            # them into memory.
+            run_mem_encoder=False,
+        )
+        # Add the output to the output dict (to be used as future memory)
+        obj_temp_output_dict[storage_key][frame_idx] = current_out
+
+        # Resize the output mask to the original video resolution
+        obj_ids = self.state["obj_ids"]
+        consolidated_out = self._consolidate_temp_output_across_obj(
+            frame_idx,
+            is_cond=is_cond,
+            run_mem_encoder=False,
+            consolidate_at_video_res=True,
+        )
+        _, video_res_masks = self._get_orig_video_res_output(
+            consolidated_out["pred_masks_video_res"]
+        )
+        return frame_idx, obj_ids, video_res_masks
