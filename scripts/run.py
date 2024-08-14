@@ -82,11 +82,78 @@ def main(args):
     frame_names.sort(key=lambda p: int(p.stem))
     interface.init_state(args.video)
 
-    ann_obj_id = 1
+    ann_obj_id = 0
     ann_frame_idx = 0
 
-    points = np.array([[210, 350]], dtype=np.float32)
+    points = np.array([[210, 350], [250, 220]], dtype=np.float32)
+    labels = np.array([1, 1], np.int32)
+    _, out_obj_ids, out_mask_logits = interface.add_new_points(
+            frame_idx=ann_frame_idx,
+            obj_id=ann_obj_id,
+            points=points,
+            labels=labels,
+    )
+
+    plt.figure(figsize=(12, 8))
+    plt.title(f"frame {ann_frame_idx}")
+    plt.imshow(Image.open(frame_names[ann_frame_idx]))
+    show_points(points, labels, plt.gca())
+    show_mask((out_mask_logits[0] > 0.0).cpu().numpy(),
+              plt.gca(), obj_id=out_obj_ids[0])
+    plt.savefig("test.png")
+
+    ann_obj_id = 0
+    ann_frame_idx = 150
+    points = np.array([[82, 415]], dtype=np.float32)
+    labels = np.array([0], np.int32)
+    _, _, out_mask_logits = interface.add_new_points(
+        frame_idx=ann_frame_idx,
+        obj_id=ann_obj_id,
+        points=points,
+        labels=labels,
+    )
+
+    video_segments = {}
+    for out_frame_idx, out_obj_ids, out_mask_logits in interface.propagate_in_video():  # NOQA
+        if out_frame_idx > 5:
+            break
+        video_segments[out_frame_idx] = {
+            out_obj_id: (out_mask_logits[i] > 0.0).cpu().numpy()
+            for i, out_obj_id in enumerate(out_obj_ids)
+        }
+
+    vis_frame_stride = 1
+    plt.close("all")
+    for out_frame_idx in range(0, 5, vis_frame_stride):
+        plt.figure(figsize=(6, 4))
+        plt.title(f"frame {out_frame_idx}")
+        plt.imshow(Image.open(frame_names[out_frame_idx]))
+        for out_obj_id, out_mask in video_segments[out_frame_idx].items():
+            show_mask(out_mask, plt.gca(), obj_id=out_obj_id)
+        plt.savefig(f"tmp/{out_frame_idx}.png")
+
+    # TWO OBJ
+    interface.reset_state()
+    prompts = {}
+    ann_frame_idx = 0
+    ann_obj_id = 0
+
+    points = np.array([[200, 300], [275, 175]], dtype=np.float32)
+    labels = np.array([1, 0], np.int32)
+    prompts[ann_obj_id] = points, labels
+    _, out_obj_ids, out_mask_logits = interface.add_new_points(
+        frame_idx=ann_frame_idx,
+        obj_id=ann_obj_id,
+        points=points,
+        labels=labels,
+    )
+    ann_frame_idx = 0
+    ann_obj_id = 1
+
+    points = np.array([[400, 150]], dtype=np.float32)
     labels = np.array([1], np.int32)
+    prompts[ann_obj_id] = points, labels
+
     _, out_obj_ids, out_mask_logits = interface.add_new_points(
         frame_idx=ann_frame_idx,
         obj_id=ann_obj_id,
@@ -96,10 +163,30 @@ def main(args):
 
     plt.figure(figsize=(12, 8))
     plt.title(f"frame {ann_frame_idx}")
-    plt.imshow(Image.open(video_dir / frame_names[ann_frame_idx]))
+    plt.imshow(Image.open(frame_names[ann_frame_idx]))
     show_points(points, labels, plt.gca())
-    show_mask((out_mask_logits[0] > 0.0).cpu().numpy(),
-              plt.gca(), obj_id=out_obj_ids[0])
+    for i, out_obj_id in enumerate(out_obj_ids):
+        show_points(*prompts[out_obj_id], plt.gca())
+        show_mask((out_mask_logits[i] > 0.0).cpu().numpy(), plt.gca(), obj_id=out_obj_id)  # NOQA
+    plt.savefig("test2.png")
+    video_segments = {}
+    for out_frame_idx, out_obj_ids, out_mask_logits in interface.propagate_in_video():  # NOQA
+        if out_frame_idx > 5:
+            break
+        video_segments[out_frame_idx] = {
+            out_obj_id: (out_mask_logits[i] > 0.0).cpu().numpy()
+            for i, out_obj_id in enumerate(out_obj_ids)
+        }
+
+    vis_frame_stride = 1
+    plt.close("all")
+    for out_frame_idx in range(0, 5, vis_frame_stride):
+        plt.figure(figsize=(6, 4))
+        plt.title(f"frame {out_frame_idx}")
+        plt.imshow(Image.open(frame_names[out_frame_idx]))
+        for out_obj_id, out_mask in video_segments[out_frame_idx].items():
+            show_mask(out_mask, plt.gca(), obj_id=out_obj_id)
+        plt.savefig(f"tmp/{out_frame_idx}_2.png")
 
 
 if __name__ == "__main__":

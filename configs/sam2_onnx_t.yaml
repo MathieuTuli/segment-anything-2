@@ -2,13 +2,13 @@
 
 # Model
 _target_: scripts.sam2_video_interface.SAM2VideoInterface
-fill_hole_area: 8
+# PP fill_hole_area: 8
 sam2_kwargs:
   binarize_mask_from_pts_for_mem_enc: true
-  sam_mask_decoder_extra_args:
-    dynamic_multimask_via_stability: true
-    dynamic_multimask_stability_delta: 0.05
-    dynamic_multimask_stability_thresh: 0.98
+  # PP sam_mask_decoder_extra_args:
+  #   PP dynamic_multimask_via_stability: true
+  #   PP dynamic_multimask_stability_delta: 0.05
+  #   PP dynamic_multimask_stability_thresh: 0.98
   image_encoder:
     _target_: sam2.modeling.backbones.image_encoder.ImageEncoder
     scalp: 1

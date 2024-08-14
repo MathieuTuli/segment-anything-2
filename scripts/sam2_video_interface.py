@@ -118,6 +118,7 @@ class SAM2VideoInterface:
             # TODO change to cuda
             image = self.state["images"][frame_idx].cpu(
             ).float().unsqueeze(0)
+            # TODO Refactor
             backbone_out = self.sam2.forward_image(image)
             # Cache the most recent frame's feature (for repeated interactions
             # with a frame; we can use an LRU cache for more
@@ -167,6 +168,7 @@ class SAM2VideoInterface:
 
         # point and mask should not appear as input imultaneously on same frame
         assert point_inputs is None or mask_inputs is None
+        # TODO Refactor
         current_out = self.sam2.track_step(
             frame_idx=frame_idx,
             is_init_cond_frame=is_init_cond_frame,
@@ -197,7 +199,7 @@ class SAM2VideoInterface:
             )
         pred_masks = pred_masks_gpu.to(storage_device, non_blocking=True)
         # "maskmem_pos_enc" is the same across frames, so we only need to store one copy of it
-        maskmem_pos_enc = self._get_maskmem_pos_enc(self.state, current_out)
+        maskmem_pos_enc = self._get_maskmem_pos_enc(current_out)
         # object pointer is a small tensor, so we always keep it on GPU memory for fast access
         obj_ptr = current_out["obj_ptr"]
         # make a compact version of this frame's output to reduce the state size
@@ -374,7 +376,9 @@ class SAM2VideoInterface:
         _, _, current_vision_feats, _, feat_sizes = self._get_image_feature(
             frame_idx, batch_size
         )
-        maskmem_features, maskmem_pos_enc = self._encode_new_memory(
+        # TODO Refactor : separate memory encoder to new model?
+        # Problem is the weights file - would need to manipulate
+        maskmem_features, maskmem_pos_enc = self.sam2._encode_new_memory(
             current_vision_feats=current_vision_feats,
             feat_sizes=feat_sizes,
             pred_masks_high_res=high_res_masks,
@@ -435,7 +439,7 @@ class SAM2VideoInterface:
                 device=self.state["storage_device"],
             ),
             "obj_ptr": torch.full(
-                size=(batch_size, self.hidden_dim),
+                size=(batch_size, self.sam2.hidden_dim),
                 fill_value=NO_OBJ_SCORE,
                 dtype=torch.float32,
                 device=self.state["device"],
@@ -499,7 +503,7 @@ class SAM2VideoInterface:
                 mode="bilinear",
                 align_corners=False,
             )
-            if self.non_overlap_masks_for_mem_enc:
+            if self.sam2.non_overlap_masks_for_mem_enc:
                 high_res_masks = self._apply_non_overlapping_constraints(
                     high_res_masks)
             maskmem_features, maskmem_pos_enc = self._run_memory_encoder(
