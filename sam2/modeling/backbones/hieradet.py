@@ -4,6 +4,8 @@
 # This source code is licensed under the license found in the
 # LICENSE file in the root directory of this source tree.
 
+
+from torch._jit_internal import _copy_to_script_wrapper
 from functools import partial
 from typing import List, Tuple, Union
 
@@ -20,18 +22,9 @@ from sam2.modeling.backbones.utils import (
 from sam2.modeling.sam2_utils import DropPath, MLP
 
 
-def do_pool(x: torch.Tensor, pool: nn.Module, norm: nn.Module = None) -> torch.Tensor:
-    if pool is None:
-        return x
-    # (B, H, W, C) -> (B, C, H, W)
-    x = x.permute(0, 3, 1, 2)
-    x = pool(x)
-    # (B, C, H', W') -> (B, H', W', C)
-    x = x.permute(0, 2, 3, 1)
-    if norm:
-        x = norm(x)
-
-    return x
+class PassThrough(nn.ModuleList):
+    def forward(self, input):
+        return input
 
 
 class MultiScaleAttention(nn.Module):
@@ -51,6 +44,7 @@ class MultiScaleAttention(nn.Module):
         self.qkv = nn.Linear(dim, dim_out * 3)
         self.proj = nn.Linear(dim_out, dim_out)
 
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         B, H, W, _ = x.shape
         # qkv with shape (B, H * W, 3, nHead, C)
@@ -59,8 +53,12 @@ class MultiScaleAttention(nn.Module):
         q, k, v = torch.unbind(qkv, 2)
 
         # Q pooling (for downsample at stage changes)
-        if self.q_pool:
-            q = do_pool(q.reshape(B, H, W, -1), self.q_pool)
+        if len(self.q_pool) > 0:
+            q = q.reshape(B, H, W, -1)
+            q = q.permute(0, 3, 1, 2)
+            x = self.q_pool(q)
+            # (B, C, H', W') -> (B, H', W', C)
+            q = q.permute(0, 2, 3, 1)
             H, W = q.shape[1:3]  # downsampled shape
             q = q.reshape(B, H * W, self.num_heads, -1)
 
@@ -105,9 +103,12 @@ class MultiScaleBlock(nn.Module):
 
         self.pool, self.q_stride = None, q_stride
         if self.q_stride:
-            self.pool = nn.MaxPool2d(
+            self.pool = nn.ModuleList([nn.MaxPool2d(
                 kernel_size=q_stride, stride=q_stride, ceil_mode=False
-            )
+            )])
+        else:
+            self.pool = PassThrough()
+
 
         self.attn = MultiScaleAttention(
             dim,
@@ -134,8 +135,12 @@ class MultiScaleBlock(nn.Module):
         x = self.norm1(x)
 
         # Skip connection
-        if self.dim != self.dim_out:
-            shortcut = do_pool(self.proj(x), self.pool)
+        if len(self.pool) > 0:
+            # (B, H, W, C) -> (B, C, H, W)
+            x = x.permute(0, 3, 1, 2)
+            x = self.pool(x)
+            # (B, C, H', W') -> (B, H', W', C)
+            shortcut = x.permute(0, 2, 3, 1)
 
         # Window partition
         window_size = self.window_size
@@ -175,27 +180,23 @@ class Hiera(nn.Module):
         num_heads: int = 1,  # initial number of heads
         drop_path_rate: float = 0.0,  # stochastic depth
         q_pool: int = 3,  # number of q_pool stages
-        q_stride: Tuple[int, int] = (2, 2),  # downsample stride bet. stages
-        stages: Tuple[int, ...] = (2, 3, 16, 3),  # blocks per stage
         dim_mul: float = 2.0,  # dim_mul factor at stage shift
         head_mul: float = 2.0,  # head_mul factor at stage shift
-        window_pos_embed_bkg_spatial_size: Tuple[int, int] = (14, 14),
-        # window size per stage, when not using global att.
-        window_spec: Tuple[int, ...] = (
+        return_interm_layers=True,  # return feats from every stage
+    ):
+
+        super().__init__()
+        stages = self.stages = [1, 2, 7, 2]
+        global_att_blocks = self.global_att_blocks = [5, 7, 9]
+        window_pos_embed_bkg_spatial_size = self.window_pos_embed_bkg_spatial_size = [7, 7]
+
+        q_stride = self.q_stride = (2, 2)
+        window_spec = self.window_spec = (
             8,
             4,
             14,
             7,
-        ),
-        # global attn in these blocks
-        global_att_blocks: Tuple[int, ...] = (
-            12,
-            16,
-            20,
-        ),
-        return_interm_layers=True,  # return feats from every stage
-    ):
-        super().__init__()
+        )
 
         assert len(stages) == len(window_spec)
         self.window_spec = window_spec
@@ -243,6 +244,9 @@ class Hiera(nn.Module):
                 dim_out = int(embed_dim * dim_mul)
                 num_heads = int(num_heads * head_mul)
                 cur_stage += 1
+
+            if embed_dim != dim_out:
+                assert i in self.q_pool_blocks
 
             block = MultiScaleBlock(
                 dim=embed_dim,

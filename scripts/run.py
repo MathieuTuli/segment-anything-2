@@ -71,6 +71,7 @@ def main(args):
     cfg = compose(config_name=args.config)
     OmegaConf.resolve(cfg)
     interface = instantiate(cfg, _recursive_=True)  # type: SAM2VideoInterface
+    raise RuntimeError("Done")
     load_checkpoint(interface, args.ckpt)
 
     # RUN

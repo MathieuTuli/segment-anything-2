@@ -30,6 +30,7 @@ class SAM2VideoInterface:
         self.state = dict()
         self.sam2 = SAM2Onnx(**sam2_kwargs)
         self.sam2.eval()
+        self.sam2 = torch.jit.script(self.sam2)
 
     def init_state(self,
                    video_path: str,
@@ -118,8 +119,12 @@ class SAM2VideoInterface:
             # TODO change to cuda
             image = self.state["images"][frame_idx].cpu(
             ).float().unsqueeze(0)
+
             # TODO Refactor
             backbone_out = self.sam2.forward_image(image)
+            # backbone_out = self.sam2(torch.ones(1), img_batch=image)
+            # ---------------------------------------------
+
             # Cache the most recent frame's feature (for repeated interactions
             # with a frame; we can use an LRU cache for more
             # frames in the future).
@@ -169,7 +174,8 @@ class SAM2VideoInterface:
         # point and mask should not appear as input imultaneously on same frame
         assert point_inputs is None or mask_inputs is None
         # TODO Refactor
-        current_out = self.sam2.track_step(
+        # current_out = self.sam2.track_step(
+        current_out = self.sam2(
             frame_idx=frame_idx,
             is_init_cond_frame=is_init_cond_frame,
             current_vision_feats=current_vision_feats,
@@ -183,6 +189,7 @@ class SAM2VideoInterface:
             run_mem_encoder=run_mem_encoder,
             prev_sam_mask_logits=prev_sam_mask_logits,
         )
+        # --------------------------------------------
 
         # optionally offload the output to CPU memory to save GPU space
         storage_device = self.state["storage_device"]

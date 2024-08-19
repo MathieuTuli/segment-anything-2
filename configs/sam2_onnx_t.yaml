@@ -16,9 +16,6 @@ sam2_kwargs:
       _target_: sam2.modeling.backbones.hieradet.Hiera
       embed_dim: 96
       num_heads: 1
-      stages: [1, 2, 7, 2]
-      global_att_blocks: [5, 7, 9]
-      window_pos_embed_bkg_spatial_size: [7, 7]
     neck:
       _target_: sam2.modeling.backbones.image_encoder.FpnNeck
       position_encoding:
