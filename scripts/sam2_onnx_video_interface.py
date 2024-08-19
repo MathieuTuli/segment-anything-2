@@ -4,7 +4,7 @@ from tqdm import tqdm
 
 import torch
 
-from scripts.sam2_onnx import SAM2Onnx
+from scripts.sam2_onnx_ext import SegmentAnything2ONNX
 from sam2.utils.misc import (
     concat_points,
     fill_holes_in_mask_scores,
@@ -16,7 +16,8 @@ NO_OBJ_SCORE = -1024.0
 
 class SAM2VideoInterface:
     def __init__(self,
-                 sam2_kwargs,
+                 encoder_model_path: str,
+                 decoder_model_path: str,
                  fill_hole_area=0,
                  non_overlap_masks=False,
                  clear_non_cond_mem_around_input=False,
@@ -28,8 +29,8 @@ class SAM2VideoInterface:
         self.clear_non_cond_mem_for_multi_obj = \
             clear_non_cond_mem_for_multi_obj
         self.state = dict()
-        self.sam2 = SAM2Onnx(**sam2_kwargs).cuda()
-        self.sam2.eval()
+        self.sam2 = SegmentAnything2ONNX(encoder_model_path=encoder_model_path,
+                                         decoder_model_path=decoder_model_path)
 
     def init_state(self,
                    video_path: str,
@@ -39,7 +40,7 @@ class SAM2VideoInterface:
                    ):
         images, video_height, video_width = load_video_frames(
             video_path=video_path,
-            image_size=self.sam2.image_size,
+            image_size=self.sam2.image_decoder.orig_image_size,
             offload_video_to_cpu=offload_video_to_cpu,
             async_loading_frames=async_loading_frames,
         )
@@ -49,7 +50,8 @@ class SAM2VideoInterface:
         self.state["offload_state_to_cpu"] = offload_state_to_cpu
         self.state["video_width"] = video_width
         self.state["video_height"] = video_height
-        self.state["device"] = torch.device("cuda")
+        # TODO change to cuda
+        self.state["device"] = torch.device("cpu")
         if offload_state_to_cpu:
             self.state["storage_device"] = torch.device("cpu")
         else:
@@ -115,7 +117,7 @@ class SAM2VideoInterface:
         if backbone_out is None:
             # Cache miss -- we will run inference on a single image
             # TODO change to cuda
-            image = self.state["images"][frame_idx].cuda(
+            image = self.state["images"][frame_idx].cpu(
             ).float().unsqueeze(0)
             # TODO Refactor
             backbone_out = self.sam2.forward_image(image)
@@ -307,7 +309,10 @@ class SAM2VideoInterface:
         # A dummy (empty) mask with a single object
         batch_size = 1
         mask_inputs = torch.zeros(
-            (batch_size, 1, self.sam2.image_size, self.sam2.image_size),
+            (batch_size,
+             1,
+             self.sam2.image_decoder.orig_image_size,
+             self.sam2.image_decoder.orig_image_size),
             dtype=torch.float32,
             device=self.state["device"],
         )
@@ -790,7 +795,7 @@ class SAM2VideoInterface:
 
         if prev_out is not None and prev_out["pred_masks"] is not None:
             # TODO change to cuda
-            prev_sam_mask_logits = prev_out["pred_masks"].cuda(
+            prev_sam_mask_logits = prev_out["pred_masks"].cpu(
                 non_blocking=True)
             # Clamp the scale of prev_sam_mask_logits to avoid rare numerical issues.
             prev_sam_mask_logits = torch.clamp(
@@ -906,3 +911,4 @@ class SAM2VideoInterface:
             consolidated_out["pred_masks_video_res"]
         )
         return frame_idx, obj_ids, video_res_masks
+

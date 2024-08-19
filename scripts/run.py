@@ -115,16 +115,14 @@ def main(args):
 
     video_segments = {}
     for out_frame_idx, out_obj_ids, out_mask_logits in interface.propagate_in_video():  # NOQA
-        if out_frame_idx > 5:
-            break
         video_segments[out_frame_idx] = {
             out_obj_id: (out_mask_logits[i] > 0.0).cpu().numpy()
             for i, out_obj_id in enumerate(out_obj_ids)
         }
 
-    vis_frame_stride = 1
+    vis_frame_stride = 15
     plt.close("all")
-    for out_frame_idx in range(0, 5, vis_frame_stride):
+    for out_frame_idx in range(0, len(frame_names), vis_frame_stride):
         plt.figure(figsize=(6, 4))
         plt.title(f"frame {out_frame_idx}")
         plt.imshow(Image.open(frame_names[out_frame_idx]))
@@ -171,16 +169,14 @@ def main(args):
     plt.savefig("test2.png")
     video_segments = {}
     for out_frame_idx, out_obj_ids, out_mask_logits in interface.propagate_in_video():  # NOQA
-        if out_frame_idx > 5:
-            break
         video_segments[out_frame_idx] = {
             out_obj_id: (out_mask_logits[i] > 0.0).cpu().numpy()
             for i, out_obj_id in enumerate(out_obj_ids)
         }
 
-    vis_frame_stride = 1
+    vis_frame_stride = 15
     plt.close("all")
-    for out_frame_idx in range(0, 5, vis_frame_stride):
+    for out_frame_idx in range(0, len(frame_names), vis_frame_stride):
         plt.figure(figsize=(6, 4))
         plt.title(f"frame {out_frame_idx}")
         plt.imshow(Image.open(frame_names[out_frame_idx]))
